@@ -16,7 +16,7 @@ implementation
 
 uses Messages, CommCtrl, RichEdit, SysUtils, Classes, DOM, uXmlModel,
   uXmlSource, uXmlCellEdit, uXmlLossless, uXmlDisplay, uNaturalSort, uColumnSample,
-  uSettings, listplug;
+  uDecimalAlign, uSettings, listplug;
 
 const
   IDC_TREE = 101;
@@ -69,6 +69,9 @@ type
     FVisibleRows: array of Integer;
     FSortColumn: Integer;
     FSortDescending: Boolean;
+    FDecimalAlign: Boolean;
+    FDecimalAnchors: array of Integer;
+    FDecimalColumns: array of Boolean;
     FCurrentRow: Integer;
     FCurrentColumn: Integer;
     FSearchText: UnicodeString;
@@ -113,6 +116,8 @@ type
     procedure LayoutFilters;
     procedure ApplyFilters;
     procedure ApplyTheme;
+    function CustomDraw(Draw: PNMLVCUSTOMDRAW): LRESULT;
+    procedure UpdateDecimalAnchors;
     procedure SetFontSize(NewSize: Integer);
     procedure UpdateText(Node: TDOMNode);
     procedure HighlightVisibleText;
@@ -228,7 +233,6 @@ var
   V: TXmlViewer;
   N: PNMHDR;
   Item: PLVDispInfoW;
-  Draw: PNMLVCUSTOMDRAW;
   HeaderDraw: PNMCustomDraw;
   HeaderItem: HDItemW;
   HeaderText: array[0..4095] of WideChar;
@@ -341,39 +345,7 @@ begin
           end;
         end;
         if (N^.hwndFrom = V.FGrid) and (Integer(N^.code) = NM_CUSTOMDRAW) then
-        begin
-          Draw := PNMLVCUSTOMDRAW(LParam);
-          if Draw^.nmcd.dwDrawStage = CDDS_PREPAINT then Exit(CDRF_NOTIFYITEMDRAW);
-          if Draw^.nmcd.dwDrawStage = CDDS_ITEMPREPAINT then
-          begin
-            if ListView_GetItemState(V.FGrid, Draw^.nmcd.dwItemSpec,
-              LVIS_SELECTED) <> 0 then
-              Draw^.nmcd.uItemState := Draw^.nmcd.uItemState and not CDIS_SELECTED;
-            Exit(CDRF_NOTIFYSUBITEMDRAW);
-          end;
-          if Draw^.nmcd.dwDrawStage = (CDDS_ITEMPREPAINT or CDDS_SUBITEM) then
-          begin
-            if ListView_GetItemState(V.FGrid, Draw^.nmcd.dwItemSpec,
-              LVIS_SELECTED) <> 0 then
-            begin
-              Draw^.clrText := V.FSelectionTextColor;
-              if (Integer(Draw^.nmcd.dwItemSpec) = V.FCurrentRow) and
-                (Draw^.iSubItem = V.FCurrentColumn) then
-                Draw^.clrTextBk := V.FCurrentCellColor
-              else
-                Draw^.clrTextBk := V.FSelectionBackColor;
-            end
-            else
-            begin
-              Draw^.clrText := V.FTextColor;
-              if (Draw^.nmcd.dwItemSpec and 1) = 0 then
-                Draw^.clrTextBk := V.FBackColor
-              else
-                Draw^.clrTextBk := V.FBackColor2;
-            end;
-            Exit(CDRF_DODEFAULT);
-          end;
-        end;
+          Exit(V.CustomDraw(PNMLVCUSTOMDRAW(LParam)));
         if (N^.hwndFrom = ListView_GetHeader(V.FGrid)) and
           (Integer(N^.code) = NM_CUSTOMDRAW) then
         begin
@@ -712,6 +684,7 @@ begin
   FDark := ReadSettingInt('dark-theme', 0) <> 0;
   FFilterVisible := ReadSettingInt('filter-row', 1) <> 0;
   FFormatText := ReadSettingInt('format-text', 1) <> 0;
+  FDecimalAlign := ReadSettingInt('decimal-align', 1) <> 0;
   FEditMode := False;
   FDirty := False;
   FCellEditor := 0;
@@ -1372,6 +1345,7 @@ begin
   end;
   SetLength(FVisibleRows, N);
   ListView_SetItemCount(FGrid, N);
+  UpdateDecimalAnchors;
   InvalidateRect(FGrid, nil, True);
   AutoSizeColumns;
   UpdateStatus;
@@ -1468,6 +1442,160 @@ begin
   for I := 0 to High(FFilterEdits) do SendMessageW(FFilterEdits[I], WM_SETFONT, FFont, 1);
   AutoSizeColumns;
   Layout;
+end;
+
+function MeasureTextWidth(DC: HDC; const S: UnicodeString): Integer;
+var
+  Size: TSize;
+begin
+  Result := 0;
+  if (S = '') or not GetTextExtentPoint32W(DC, PWideChar(S), Length(S), Size) then
+    Exit;
+  Result := Size.cx;
+end;
+
+procedure TXmlViewer.UpdateDecimalAnchors;
+var
+  DC: HDC;
+  OldFont: HGDIOBJ;
+  Column, Row, SourceRow, Width: Integer;
+  S, IntegerPart, FractionPart: UnicodeString;
+  Separator: WideChar;
+begin
+  SetLength(FDecimalAnchors, Header_GetItemCount(ListView_GetHeader(FGrid)));
+  SetLength(FDecimalColumns, Length(FDecimalAnchors));
+  if not FDecimalAlign or not IsWindow(FGrid) then Exit;
+  DC := GetDC(FGrid);
+  if DC = 0 then Exit;
+  OldFont := SelectObject(DC, FFont);
+  try
+    for Column := 0 to High(FDecimalAnchors) do
+      for Row := 0 to High(FVisibleRows) do
+      begin
+        SourceRow := FVisibleRows[Row];
+        if (SourceRow < 0) or (SourceRow >= Length(FRows)) or
+          (Column >= Length(FRows[SourceRow])) then Continue;
+        S := FRows[SourceRow][Column];
+        if SplitDecimalText(S, IntegerPart, FractionPart, Separator) then
+        begin
+          FDecimalColumns[Column] := True;
+          Width := MeasureTextWidth(DC, IntegerPart);
+          if Width > FDecimalAnchors[Column] then FDecimalAnchors[Column] := Width;
+        end;
+        if IsIntegerText(S) then
+        begin
+          Width := MeasureTextWidth(DC, Trim(S));
+          if Width > FDecimalAnchors[Column] then FDecimalAnchors[Column] := Width;
+        end;
+      end;
+  finally
+    SelectObject(DC, OldFont);
+    ReleaseDC(FGrid, DC);
+  end;
+end;
+
+function TXmlViewer.CustomDraw(Draw: PNMLVCUSTOMDRAW): LRESULT;
+var
+  Row, Column, SourceRow, Anchor, SavedDC: Integer;
+  Selected, CurrentCell: Boolean;
+  R, TextRect: TRect;
+  Brush: HBRUSH;
+  S, IntegerPart, FractionPart, DecimalText: UnicodeString;
+  Separator: WideChar;
+  OldTextColor: COLORREF;
+  OldBkMode: Integer;
+  OldFont: HGDIOBJ;
+  Pen, OldPen: HPEN;
+begin
+  Result := CDRF_DODEFAULT;
+  if not Assigned(Draw) then Exit;
+  if Draw^.nmcd.dwDrawStage = CDDS_PREPAINT then Exit(CDRF_NOTIFYITEMDRAW);
+  if Draw^.nmcd.dwDrawStage = CDDS_ITEMPREPAINT then
+  begin
+    Row := Integer(Draw^.nmcd.dwItemSpec);
+    Selected := (ListView_GetItemState(FGrid, Row, LVIS_SELECTED) and
+      LVIS_SELECTED) <> 0;
+    if Selected then Draw^.nmcd.uItemState := Draw^.nmcd.uItemState and not CDIS_SELECTED;
+    Exit(CDRF_NOTIFYSUBITEMDRAW);
+  end;
+  if Draw^.nmcd.dwDrawStage <> (CDDS_ITEMPREPAINT or CDDS_SUBITEM) then Exit;
+  Row := Integer(Draw^.nmcd.dwItemSpec);
+  Selected := (ListView_GetItemState(FGrid, Row, LVIS_SELECTED) and
+    LVIS_SELECTED) <> 0;
+  if Selected then
+  begin
+    CurrentCell := (Row = FCurrentRow) and (Draw^.iSubItem = FCurrentColumn);
+    Draw^.clrText := FSelectionTextColor;
+    if CurrentCell then Draw^.clrTextBk := FCurrentCellColor
+    else Draw^.clrTextBk := FSelectionBackColor;
+  end
+  else
+  begin
+    Draw^.clrText := FTextColor;
+    if Odd(Row) then Draw^.clrTextBk := FBackColor2 else Draw^.clrTextBk := FBackColor;
+  end;
+  Column := Draw^.iSubItem;
+  if not FDecimalAlign or (Column < 0) or (Column >= Length(FDecimalAnchors)) or
+    (Row < 0) or (Row >= Length(FVisibleRows)) then Exit;
+  SourceRow := FVisibleRows[Row];
+  if (SourceRow < 0) or (SourceRow >= Length(FRows)) or
+    (Column >= Length(FRows[SourceRow])) then Exit;
+  S := FRows[SourceRow][Column];
+  if not SplitDecimalText(S, IntegerPart, FractionPart, Separator) and
+    not IsIntegerText(S) then Exit;
+  FillChar(R, SizeOf(R), 0);
+  R.Top := Column;
+  R.Left := LVIR_BOUNDS;
+  if SendMessageW(FGrid, LVM_GETSUBITEMRECT, Row, LPARAM(@R)) = 0 then
+    R := Draw^.nmcd.rc;
+  if Column = 0 then R.Right := R.Left + ListView_GetColumnWidth(FGrid, 0);
+  Brush := CreateSolidBrush(Draw^.clrTextBk);
+  FillRect(Draw^.nmcd.hdc, R, Brush);
+  DeleteObject(Brush);
+  SavedDC := SaveDC(Draw^.nmcd.hdc);
+  IntersectClipRect(Draw^.nmcd.hdc, R.Left + 1, R.Top + 1, R.Right - 1, R.Bottom - 1);
+  OldFont := SelectObject(Draw^.nmcd.hdc, FFont);
+  OldTextColor := SetTextColor(Draw^.nmcd.hdc, Draw^.clrText);
+  OldBkMode := SetBkMode(Draw^.nmcd.hdc, TRANSPARENT);
+  TextRect := R;
+  if Separator = #0 then
+  begin
+    TextRect.Left := R.Left + 6;
+    TextRect.Right := IntegerTextRightEdge(R.Left, R.Right, 6,
+      FDecimalAnchors[Column], (Column < Length(FDecimalColumns)) and
+      FDecimalColumns[Column]);
+    DrawTextW(Draw^.nmcd.hdc, PWideChar(S), -1, TextRect,
+      DT_RIGHT or DT_VCENTER or DT_SINGLELINE or DT_END_ELLIPSIS);
+  end
+  else
+  begin
+    Anchor := R.Left + 6 + FDecimalAnchors[Column];
+    TextRect.Left := R.Left + 6;
+    TextRect.Right := Anchor;
+    DrawTextW(Draw^.nmcd.hdc, PWideChar(IntegerPart), -1, TextRect,
+      DT_RIGHT or DT_VCENTER or DT_SINGLELINE);
+    DecimalText := Separator + FractionPart;
+    TextRect.Left := Anchor;
+    TextRect.Right := R.Right - 6;
+    DrawTextW(Draw^.nmcd.hdc, PWideChar(DecimalText), -1, TextRect,
+      DT_LEFT or DT_VCENTER or DT_SINGLELINE or DT_END_ELLIPSIS);
+  end;
+  SetBkMode(Draw^.nmcd.hdc, OldBkMode);
+  SetTextColor(Draw^.nmcd.hdc, OldTextColor);
+  SelectObject(Draw^.nmcd.hdc, OldFont);
+  RestoreDC(Draw^.nmcd.hdc, SavedDC);
+  if (ListView_GetExtendedListViewStyle(FGrid) and LVS_EX_GRIDLINES) <> 0 then
+  begin
+    Pen := CreatePen(PS_SOLID, 1, GetSysColor(COLOR_3DFACE));
+    OldPen := SelectObject(Draw^.nmcd.hdc, Pen);
+    MoveToEx(Draw^.nmcd.hdc, R.Right - 1, R.Top, nil);
+    LineTo(Draw^.nmcd.hdc, R.Right - 1, R.Bottom);
+    MoveToEx(Draw^.nmcd.hdc, R.Left, R.Bottom - 1, nil);
+    LineTo(Draw^.nmcd.hdc, R.Right, R.Bottom - 1);
+    SelectObject(Draw^.nmcd.hdc, OldPen);
+    DeleteObject(Pen);
+  end;
+  Result := CDRF_SKIPDEFAULT;
 end;
 
 procedure TXmlViewer.UpdateText(Node: TDOMNode);
@@ -1703,6 +1831,7 @@ begin
     SelectObject(DC, OldFont);
     ReleaseDC(FGrid, DC);
   end;
+  UpdateDecimalAnchors;
   LayoutFilters;
 end;
 
@@ -1843,6 +1972,7 @@ begin
   if FiltersActive then ApplyFilters
   else
   begin
+    UpdateDecimalAnchors;
     InvalidateRect(FGrid, nil, False);
     UpdateEditStatus;
   end;
@@ -1948,6 +2078,7 @@ begin
   else begin FSortColumn := Column; FSortDescending := False; end;
   SetLength(Temp, Length(FVisibleRows));
   MergeSort(0, High(FVisibleRows));
+  UpdateDecimalAnchors;
   InvalidateRect(FGrid, nil, True); AutoSizeColumns;
 end;
 
