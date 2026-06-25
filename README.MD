@@ -1,5 +1,7 @@
 # xmltab-wlx Extended
 
+![xml](xml.png)
+
 A native Win32/Win64 Total Commander WLX plugin for viewing and editing XML
 files in a combined tree, virtual table, and formatted text view.
 
