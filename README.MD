@@ -32,14 +32,6 @@ source view, and edit values without losing the original file style.
 - Feel native in Total Commander: Win32 and Win64 WLX builds, GPX detection
   by default, context menus, and host hotkey forwarding where it belongs.
 
-## Background
-
-This project is a Lazarus/FPC migration and extended implementation of the
-original C plugin
-[little-brother/xmltab-wlx](https://github.com/little-brother/xmltab-wlx).
-The original source is retained in [`xmltab-wlx-orig`](xmltab-wlx-orig) for
-reference.
-
 ## Installation
 
 1. Copy `xmltab.wlx` and `xmltab.wlx64` to the desired plugin directory.
